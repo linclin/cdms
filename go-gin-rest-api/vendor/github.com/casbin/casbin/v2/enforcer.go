@@ -17,11 +17,11 @@ package casbin
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"sync"
 
-	"github.com/Knetic/govaluate"
 	"github.com/casbin/casbin/v2/effector"
 	"github.com/casbin/casbin/v2/log"
 	"github.com/casbin/casbin/v2/model"
@@ -30,6 +30,9 @@ import (
 	"github.com/casbin/casbin/v2/rbac"
 	defaultrolemanager "github.com/casbin/casbin/v2/rbac/default-role-manager"
 	"github.com/casbin/casbin/v2/util"
+
+	"github.com/Knetic/govaluate"
+	"github.com/tidwall/gjson"
 )
 
 // Enforcer is the main interface for authorization enforcement and policy management.
@@ -43,6 +46,7 @@ type Enforcer struct {
 	watcher    persist.Watcher
 	dispatcher persist.Dispatcher
 	rmMap      map[string]rbac.RoleManager
+	condRmMap  map[string]rbac.ConditionalRoleManager
 	matcherMap sync.Map
 
 	enabled              bool
@@ -50,6 +54,7 @@ type Enforcer struct {
 	autoBuildRoleLinks   bool
 	autoNotifyWatcher    bool
 	autoNotifyDispatcher bool
+	acceptJsonRequest    bool
 
 	logger log.Logger
 }
@@ -60,6 +65,10 @@ type EnforceContext struct {
 	PType string
 	EType string
 	MType string
+}
+
+func (e EnforceContext) GetCacheKey() string {
+	return "EnforceContext{" + e.RType + "-" + e.PType + "-" + e.EType + "-" + e.MType + "}"
 }
 
 // NewEnforcer creates an enforcer via file or DB.
@@ -197,6 +206,7 @@ func (e *Enforcer) SetLogger(logger log.Logger) {
 
 func (e *Enforcer) initialize() {
 	e.rmMap = map[string]rbac.RoleManager{}
+	e.condRmMap = map[string]rbac.ConditionalRoleManager{}
 	e.eft = effector.NewDefaultEffector()
 	e.watcher = nil
 	e.matcherMap = sync.Map{}
@@ -332,18 +342,50 @@ func (e *Enforcer) LoadPolicy() error {
 
 	if e.autoBuildRoleLinks {
 		needToRebuild = true
+		if err := e.rebuildRoleLinks(newModel); err != nil {
+			return err
+		}
+
+		if err := e.rebuildConditionalRoleLinks(newModel); err != nil {
+			return err
+		}
+	}
+	e.model = newModel
+	return nil
+}
+
+func (e *Enforcer) rebuildRoleLinks(newModel model.Model) error {
+	if len(e.rmMap) != 0 {
 		for _, rm := range e.rmMap {
 			err := rm.Clear()
 			if err != nil {
 				return err
 			}
 		}
-		err = newModel.BuildRoleLinks(e.rmMap)
+
+		err := newModel.BuildRoleLinks(e.rmMap)
 		if err != nil {
 			return err
 		}
 	}
-	e.model = newModel
+
+	return nil
+}
+
+func (e *Enforcer) rebuildConditionalRoleLinks(newModel model.Model) error {
+	if len(e.condRmMap) != 0 {
+		for _, crm := range e.condRmMap {
+			err := crm.Clear()
+			if err != nil {
+				return err
+			}
+		}
+
+		err := newModel.BuildConditionalRoleLinks(e.condRmMap)
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -424,11 +466,23 @@ func (e *Enforcer) SavePolicy() error {
 }
 
 func (e *Enforcer) initRmMap() {
-	for ptype := range e.model["g"] {
+	for ptype, assertion := range e.model["g"] {
 		if rm, ok := e.rmMap[ptype]; ok {
 			_ = rm.Clear()
-		} else {
-			e.rmMap[ptype] = defaultrolemanager.NewRoleManager(10)
+			continue
+		}
+		if len(assertion.Tokens) <= 2 && len(assertion.ParamsTokens) == 0 {
+			e.rmMap[ptype] = defaultrolemanager.NewRoleManagerImpl(10)
+		}
+		if len(assertion.Tokens) <= 2 && len(assertion.ParamsTokens) != 0 {
+			e.condRmMap[ptype] = defaultrolemanager.NewConditionalRoleManager(10)
+		}
+		if len(assertion.Tokens) > 2 {
+			if len(assertion.ParamsTokens) == 0 {
+				e.rmMap[ptype] = defaultrolemanager.NewRoleManager(10)
+			} else {
+				e.condRmMap[ptype] = defaultrolemanager.NewConditionalDomainManager(10)
+			}
 			matchFun := "keyMatch(r_dom, p_dom)"
 			if strings.Contains(e.model["m"]["m"].Value, matchFun) {
 				e.AddNamedDomainMatchingFunc(ptype, "g", util.KeyMatch)
@@ -472,6 +526,11 @@ func (e *Enforcer) EnableAutoBuildRoleLinks(autoBuildRoleLinks bool) {
 	e.autoBuildRoleLinks = autoBuildRoleLinks
 }
 
+// EnableAcceptJsonRequest controls whether to accept json as a request parameter
+func (e *Enforcer) EnableAcceptJsonRequest(acceptJsonRequest bool) {
+	e.acceptJsonRequest = acceptJsonRequest
+}
+
 // BuildRoleLinks manually rebuild the role inheritance relations.
 func (e *Enforcer) BuildRoleLinks() error {
 	for _, rm := range e.rmMap {
@@ -488,6 +547,12 @@ func (e *Enforcer) BuildRoleLinks() error {
 func (e *Enforcer) BuildIncrementalRoleLinks(op model.PolicyOp, ptype string, rules [][]string) error {
 	e.invalidateMatcherMap()
 	return e.model.BuildIncrementalRoleLinks(e.rmMap, op, "g", ptype, rules)
+}
+
+// BuildIncrementalConditionalRoleLinks provides incremental build the role inheritance relations with conditions.
+func (e *Enforcer) BuildIncrementalConditionalRoleLinks(op model.PolicyOp, ptype string, rules [][]string) error {
+	e.invalidateMatcherMap()
+	return e.model.BuildIncrementalConditionalRoleLinks(e.condRmMap, op, "g", ptype, rules)
 }
 
 // NewEnforceContext Create a default structure based on the suffix
@@ -519,8 +584,12 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	functions := e.fm.GetFunctions()
 	if _, ok := e.model["g"]; ok {
 		for key, ast := range e.model["g"] {
-			rm := ast.RM
-			functions[key] = util.GenerateGFunction(rm)
+			if len(e.rmMap) != 0 {
+				functions[key] = util.GenerateGFunction(ast.RM)
+			}
+			if len(e.condRmMap) != 0 {
+				functions[key] = util.GenerateConditionalGFunction(ast.CondRM)
+			}
 		}
 	}
 
@@ -558,6 +627,10 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	pTokens := make(map[string]int, len(e.model["p"][pType].Tokens))
 	for i, token := range e.model["p"][pType].Tokens {
 		pTokens[token] = i
+	}
+
+	if e.acceptJsonRequest {
+		expString = requestJsonReplace(expString, rTokens, rvals)
 	}
 
 	parameters := enforceParameters{
@@ -605,7 +678,16 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 					pvals)
 			}
 
-			parameters.pVals = pvals
+			if e.acceptJsonRequest {
+				pvalsCopy := make([]string, len(pvals))
+				copy(pvalsCopy, pvals)
+				for i, pStr := range pvalsCopy {
+					pvalsCopy[i] = requestJsonReplace(util.EscapeAssertion(pStr), rTokens, rvals)
+				}
+				parameters.pVals = pvalsCopy
+			} else {
+				parameters.pVals = pvals
+			}
 
 			result, err := expression.Eval(parameters)
 			// log.LogPrint("Result: ", result)
@@ -642,9 +724,9 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 				policyEffects[policyIndex] = effector.Allow
 			}
 
-			//if e.model["e"]["e"].Value == "priority(p_eft) || deny" {
+			// if e.model["e"]["e"].Value == "priority(p_eft) || deny" {
 			//	break
-			//}
+			// }
 
 			effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][eType].Value, policyEffects, matcherResults, policyIndex, policyLen)
 			if err != nil {
@@ -705,6 +787,31 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	e.logger.LogEnforce(expString, rvals, result, logExplains)
 
 	return result, nil
+}
+
+var requestObjectRegex = regexp.MustCompile(`r[_.][A-Za-z_0-9]+\.[A-Za-z_0-9.]+[A-Za-z_0-9]`)
+var requestObjectRegexPrefix = regexp.MustCompile(`r[_.][A-Za-z_0-9]+\.`)
+
+// requestJsonReplace used to support request parameters of type json
+// It will replace the access of the request object in matchers or policy with the actual value in the request json parameter
+// For example: request sub = `{"Owner": "alice", "Age": 30}`
+// policy: p, r.sub.Age > 18, /data1, read  ==>  p, 30 > 18, /data1, read
+// matchers: m = r.sub == r.obj.Owner  ==>  m = r.sub == "alice"
+func requestJsonReplace(str string, rTokens map[string]int, rvals []interface{}) string {
+	matches := requestObjectRegex.FindStringSubmatch(str)
+	for _, matchesStr := range matches {
+		prefix := requestObjectRegexPrefix.FindString(matchesStr)
+		jsonPath := strings.TrimPrefix(matchesStr, prefix)
+		tokenIndex := rTokens[prefix[:len(prefix)-1]]
+		if jsonStr, ok := rvals[tokenIndex].(string); ok {
+			newStr := gjson.Get(jsonStr, jsonPath).String()
+			if !util.IsNumeric(newStr) {
+				newStr = `"` + newStr + `"`
+			}
+			str = strings.Replace(str, matchesStr, newStr, -1)
+		}
+	}
+	return str
 }
 
 func (e *Enforcer) getAndStoreMatcherExpression(hasEval bool, expString string, functions map[string]govaluate.ExpressionFunction) (*govaluate.EvaluableExpression, error) {
@@ -792,6 +899,45 @@ func (e *Enforcer) AddNamedDomainMatchingFunc(ptype, name string, fn rbac.Matchi
 	return false
 }
 
+// AddNamedLinkConditionFunc Add condition function fn for Link userName->roleName,
+// when fn returns true, Link is valid, otherwise invalid
+func (e *Enforcer) AddNamedLinkConditionFunc(ptype, user, role string, fn rbac.LinkConditionFunc) bool {
+	if rm, ok := e.condRmMap[ptype]; ok {
+		rm.AddLinkConditionFunc(user, role, fn)
+		return true
+	}
+	return false
+}
+
+// AddNamedDomainLinkConditionFunc Add condition function fn for Link userName-> {roleName, domain},
+// when fn returns true, Link is valid, otherwise invalid
+func (e *Enforcer) AddNamedDomainLinkConditionFunc(ptype, user, role string, domain string, fn rbac.LinkConditionFunc) bool {
+	if rm, ok := e.condRmMap[ptype]; ok {
+		rm.AddDomainLinkConditionFunc(user, role, domain, fn)
+		return true
+	}
+	return false
+}
+
+// SetNamedLinkConditionFuncParams Sets the parameters of the condition function fn for Link userName->roleName
+func (e *Enforcer) SetNamedLinkConditionFuncParams(ptype, user, role string, params ...string) bool {
+	if rm, ok := e.condRmMap[ptype]; ok {
+		rm.SetLinkConditionFuncParams(user, role, params...)
+		return true
+	}
+	return false
+}
+
+// SetNamedDomainLinkConditionFuncParams Sets the parameters of the condition function fn
+// for Link userName->{roleName, domain}
+func (e *Enforcer) SetNamedDomainLinkConditionFuncParams(ptype, user, role, domain string, params ...string) bool {
+	if rm, ok := e.condRmMap[ptype]; ok {
+		rm.SetDomainLinkConditionFuncParams(user, role, domain, params...)
+		return true
+	}
+	return false
+}
+
 // assumes bounds have already been checked
 type enforceParameters struct {
 	rTokens map[string]int
@@ -828,17 +974,17 @@ func (p enforceParameters) Get(name string) (interface{}, error) {
 func generateEvalFunction(functions map[string]govaluate.ExpressionFunction, parameters *enforceParameters) govaluate.ExpressionFunction {
 	return func(args ...interface{}) (interface{}, error) {
 		if len(args) != 1 {
-			return nil, fmt.Errorf("Function eval(subrule string) expected %d arguments, but got %d", 1, len(args))
+			return nil, fmt.Errorf("function eval(subrule string) expected %d arguments, but got %d", 1, len(args))
 		}
 
 		expression, ok := args[0].(string)
 		if !ok {
-			return nil, errors.New("Argument of eval(subrule string) must be a string")
+			return nil, errors.New("argument of eval(subrule string) must be a string")
 		}
 		expression = util.EscapeAssertion(expression)
 		expr, err := govaluate.NewEvaluableExpressionWithFunctions(expression, functions)
 		if err != nil {
-			return nil, fmt.Errorf("Error while parsing eval parameter: %s, %s", expression, err.Error())
+			return nil, fmt.Errorf("error while parsing eval parameter: %s, %s", expression, err.Error())
 		}
 		return expr.Eval(parameters)
 	}

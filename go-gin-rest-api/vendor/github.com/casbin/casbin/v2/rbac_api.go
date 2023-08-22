@@ -86,7 +86,7 @@ func (e *Enforcer) DeleteRolesForUser(user string, domain ...string) (bool, erro
 	if len(domain) == 0 {
 		args = []string{user}
 	} else if len(domain) > 1 {
-		return false, errors.ERR_DOMAIN_PARAMETER
+		return false, errors.ErrDomainParameter
 	} else {
 		args = []string{user, "", domain[0]}
 	}
@@ -306,7 +306,7 @@ func (e *Enforcer) GetNamedImplicitPermissionsForUser(ptype string, user string,
 				permission = append(permission, deepCopyPolicy(rule))
 			}
 		} else if len(domain) > 1 {
-			return nil, errors.ERR_DOMAIN_PARAMETER
+			return nil, errors.ErrDomainParameter
 		} else {
 			d := domain[0]
 			matched := rm.Match(d, rule[domainIndex])
@@ -440,15 +440,125 @@ func (e *Enforcer) GetAllowedObjectConditions(user string, action string, prefix
 		// policy {sub, obj, act}
 		if policy[2] == action {
 			if !strings.HasPrefix(policy[1], prefix) {
-				return nil, errors.ERR_OBJ_CONDITION
+				return nil, errors.ErrObjCondition
 			}
 			objectConditions = append(objectConditions, strings.TrimPrefix(policy[1], prefix))
 		}
 	}
 
 	if len(objectConditions) == 0 {
-		return nil, errors.ERR_EMPTY_CONDITION
+		return nil, errors.ErrEmptyCondition
 	}
 
 	return objectConditions, nil
+}
+
+// removeDuplicatePermissions Convert permissions to string as a hash to deduplicate.
+func removeDuplicatePermissions(permissions [][]string) [][]string {
+	permissionsSet := make(map[string]bool)
+	res := make([][]string, 0)
+	for _, permission := range permissions {
+		permissionStr := util.ArrayToString(permission)
+		if permissionsSet[permissionStr] {
+			continue
+		}
+		permissionsSet[permissionStr] = true
+		res = append(res, permission)
+	}
+	return res
+}
+
+// GetImplicitUsersForResource return implicit user based on resource.
+// for example:
+// p, alice, data1, read
+// p, bob, data2, write
+// p, data2_admin, data2, read
+// p, data2_admin, data2, write
+// g, alice, data2_admin
+// GetImplicitUsersForResource("data2") will return [[bob data2 write] [alice data2 read] [alice data2 write]]
+// GetImplicitUsersForResource("data1") will return [[alice data1 read]]
+// Note: only users will be returned, roles (2nd arg in "g") will be excluded.
+func (e *Enforcer) GetImplicitUsersForResource(resource string) ([][]string, error) {
+	permissions := make([][]string, 0)
+	subjectIndex, _ := e.GetFieldIndex("p", "sub")
+	objectIndex, _ := e.GetFieldIndex("p", "obj")
+	rm := e.GetRoleManager()
+
+	isRole := make(map[string]bool)
+	for _, role := range e.GetAllRoles() {
+		isRole[role] = true
+	}
+
+	for _, rule := range e.model["p"]["p"].Policy {
+		obj := rule[objectIndex]
+		if obj != resource {
+			continue
+		}
+
+		sub := rule[subjectIndex]
+
+		if !isRole[sub] {
+			permissions = append(permissions, rule)
+		} else {
+			users, err := rm.GetUsers(sub)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, user := range users {
+				implicitUserRule := deepCopyPolicy(rule)
+				implicitUserRule[subjectIndex] = user
+				permissions = append(permissions, implicitUserRule)
+			}
+		}
+	}
+
+	res := removeDuplicatePermissions(permissions)
+	return res, nil
+}
+
+// GetImplicitUsersForResourceByDomain return implicit user based on resource and domain.
+// Compared to GetImplicitUsersForResource, domain is supported
+func (e *Enforcer) GetImplicitUsersForResourceByDomain(resource string, domain string) ([][]string, error) {
+	permissions := make([][]string, 0)
+	subjectIndex, _ := e.GetFieldIndex("p", "sub")
+	objectIndex, _ := e.GetFieldIndex("p", "obj")
+	domIndex, _ := e.GetFieldIndex("p", "dom")
+	rm := e.GetRoleManager()
+
+	isRole := make(map[string]bool)
+
+	for _, role := range e.GetAllRolesByDomain(domain) {
+		isRole[role] = true
+	}
+
+	for _, rule := range e.model["p"]["p"].Policy {
+		obj := rule[objectIndex]
+		if obj != resource {
+			continue
+		}
+
+		sub := rule[subjectIndex]
+
+		if !isRole[sub] {
+			permissions = append(permissions, rule)
+		} else {
+			if domain != rule[domIndex] {
+				continue
+			}
+			users, err := rm.GetUsers(sub, domain)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, user := range users {
+				implicitUserRule := deepCopyPolicy(rule)
+				implicitUserRule[subjectIndex] = user
+				permissions = append(permissions, implicitUserRule)
+			}
+		}
+	}
+
+	res := removeDuplicatePermissions(permissions)
+	return res, nil
 }

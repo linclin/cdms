@@ -641,7 +641,7 @@ func (a *Adapter) AddPolicy(sec string, ptype string, rule []string) error {
 // RemovePolicy removes a policy rule from the storage.
 func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 	line := a.savePolicyLine(ptype, rule)
-	err := a.rawDelete(a.db, line) //can't use db.Delete as we're not using primary key http://jinzhu.me/gorm/crud.html#delete
+	err := a.rawDelete(a.db, line) //can't use db.Delete as we're not using primary key https://gorm.io/docs/update.html
 	return err
 }
 
@@ -687,8 +687,7 @@ func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) err
 	return a.db.Transaction(func(tx *gorm.DB) error {
 		for _, rule := range rules {
 			line := a.savePolicyLine(ptype, rule)
-			if err := a.rawDelete(tx, line); err != nil { //can't use db.Delete as we're not using primary key http://jinzhu.me/gorm/crud.html#delete
-				return err
+			if err := a.rawDelete(tx, line); err != nil { //can't use db.Delete as we're not using primary key https://gorm.io/docs/update.html
 			}
 		}
 		return nil
@@ -976,4 +975,28 @@ func (c *CasbinRule) toStringPolicy() []string {
 		policy = append(policy, c.V5)
 	}
 	return policy
+}
+
+// CombineType represents different types of condition combining strategies
+type CombineType uint32
+
+const (
+	CombineTypeOr  CombineType = iota // Combine conditions with OR operator
+	CombineTypeAnd                    // Combine conditions with AND operator
+)
+
+// ConditionsToGormQuery is a function that converts multiple query conditions into a GORM query statement
+// You can use the GetAllowedObjectConditions() API of Casbin to get conditions,
+// and choose the way of combining conditions through combineType.
+func ConditionsToGormQuery(db *gorm.DB, conditions []string, combineType CombineType) *gorm.DB {
+	queryDB := db
+	for _, cond := range conditions {
+		switch combineType {
+		case CombineTypeOr:
+			queryDB = queryDB.Or(cond)
+		case CombineTypeAnd:
+			queryDB = queryDB.Where(cond)
+		}
+	}
+	return queryDB
 }
