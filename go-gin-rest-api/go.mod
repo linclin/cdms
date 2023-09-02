@@ -7,7 +7,7 @@ require (
 	github.com/alibaba/sentinel-golang v1.0.4
 	github.com/appleboy/gin-jwt/v2 v2.9.1
 	github.com/casbin/casbin/v2 v2.77.1
-	github.com/casbin/gorm-adapter/v3 v3.18.1
+	github.com/casbin/gorm-adapter/v3 v3.19.0
 	github.com/fsnotify/fsnotify v1.6.0
 	github.com/gin-contrib/cors v1.4.0
 	github.com/gin-contrib/gzip v0.0.6

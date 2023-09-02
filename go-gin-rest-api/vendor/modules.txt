@@ -80,7 +80,7 @@ github.com/casbin/casbin/v2/persist/file-adapter
 github.com/casbin/casbin/v2/rbac
 github.com/casbin/casbin/v2/rbac/default-role-manager
 github.com/casbin/casbin/v2/util
-# github.com/casbin/gorm-adapter/v3 v3.18.1
+# github.com/casbin/gorm-adapter/v3 v3.19.0
 ## explicit; go 1.20
 github.com/casbin/gorm-adapter/v3
 # github.com/cespare/xxhash/v2 v2.2.0
