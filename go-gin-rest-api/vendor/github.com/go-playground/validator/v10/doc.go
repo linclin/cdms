@@ -194,6 +194,13 @@ such as min or max won't run, but if a value is set validation will run.
 
 	Usage: omitempty
 
+# Omit Nil
+
+Allows to skip the validation if the value is nil (same as omitempty, but
+only for the nil-values).
+
+	Usage: omitnil
+
 # Dive
 
 This tells the validator to dive into a slice, array or map and validate that
@@ -908,6 +915,15 @@ This validataes that a string value contains a valid URN
 according to the RFC 2141 spec.
 
 	Usage: urn_rfc2141
+
+# Base32 String
+
+This validates that a string value contains a valid bas324 value.
+Although an empty string is valid base32 this will report an empty string
+as an error, if you wish to accept an empty string as valid you can use
+this with the omitempty tag.
+
+	Usage: base32
 
 # Base64 String
 

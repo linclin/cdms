@@ -8,14 +8,12 @@ import (
 	"go-gin-rest-api/pkg/global"
 	sysRouter "go-gin-rest-api/router/sys"
 
-	"time"
-
 	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-contrib/pprof"
 	"github.com/gin-contrib/requestid"
-	ginzap "github.com/gin-contrib/zap"
 	"github.com/gin-gonic/gin"
+	sloggin "github.com/samber/slog-gin"
 	sentinelPlugin "github.com/sentinel-group/sentinel-go-adapters/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -50,6 +48,8 @@ func Routers() *gin.Engine {
 	r := gin.New()
 	// 初始化Trace中间件
 	r.Use(requestid.New())
+	// slog日志
+	r.Use(sloggin.New(global.Log))
 	// 添加访问记录
 	r.Use(middleware.AccessLog)
 	// 添加全局异常处理中间件
@@ -58,9 +58,6 @@ func Routers() *gin.Engine {
 	r.Use(gzip.Gzip(gzip.DefaultCompression))
 	// 添加跨域中间件, 让请求支持跨域
 	r.Use(cors.Default())
-	// zap日志记录插件
-	r.Use(ginzap.Ginzap(global.Logger, time.RFC3339, true))
-	r.Use(ginzap.RecoveryWithZap(global.Logger, true))
 	// 添加sentinel中间件
 	r.Use(
 		sentinelPlugin.SentinelMiddleware(
